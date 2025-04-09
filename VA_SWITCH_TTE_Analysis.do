@@ -13,7 +13,7 @@ log using "Logs\va_switch_tte_`date'.log", replace
 
 ********************************************************************************
 * Clinical Outcomes Following a National Inhaler Formulary Change
-*	- TTE Secondar Analysis
+*	- TTE Sensitivity Analysis
 * Author: Sarah Seelye
 *
 * Date Created: 2024 Dec 10		
@@ -70,6 +70,9 @@ merge m:1 patienticn using `combat'
 tab patrecnum if patrecnum==1 & _merge==1
 list patienticn if patrecnum==1 & _merge==1 
 
+* recode 4 patients with missing combat status as not a combat veteran
+replace ever_combatvet=0 if _merge==1
+
 * drop patients not in analytic dataset 
 drop if _merge==2
 
@@ -114,8 +117,8 @@ bysort patienticn (datevalue): egen postperiod_pat = max(postperiod)
 	count if patrecnum==1 & (preperiod_pat==0 | postperiod_pat==0)
 	count if patrecnum==1 & (preperiod_pat==1 | postperiod_pat==1)
 	
-	drop if (preperiod_pat==0 | postperiod_pat==0) 
-	count if patrecnum==1 & (preperiod_pat==1 | postperiod_pat==1) 
+	drop if (preperiod_pat==0 | postperiod_pat==0) //255243
+	count if patrecnum==1 & (preperiod_pat==1 | postperiod_pat==1) //327580
 	
 	* identify patients who had a controller inhaler during each of the time periods 
 	gen controller_inhaler = inhaler_type>0
@@ -133,8 +136,8 @@ bysort patienticn (datevalue): egen postperiod_pat = max(postperiod)
 	count if patrecnum==1 & (preperiod_inhaler_pat==0 | postperiod_inhaler_pat==0)
 	count if patrecnum==1 & (preperiod_inhaler_pat==1 | postperiod_inhaler_pat==1)
 	
-	drop if (preperiod_inhaler_pat==0 | postperiod_inhaler_pat==0) 
-	count if patrecnum==1 & (preperiod_inhaler_pat==1 | postperiod_inhaler_pat==1) 
+	drop if (preperiod_inhaler_pat==0 | postperiod_inhaler_pat==0) //1,608,087
+	count if patrecnum==1 & (preperiod_inhaler_pat==1 | postperiod_inhaler_pat==1) //276369
 
 *-------------------------------------	
 * identify treatment strategies 
@@ -153,8 +156,119 @@ replace mkg_tx2 = 1 if inlist(inhaler_type, 1, 3) & postperiod==1
 replace mkg_tx2 = 0 if switch_to_wixela==1 
 bysort patienticn (datevalue): egen stay_on_nonwixela = max(mkg_tx2)	
 
+
+*----------------------
+* Enrollment date
+*----------------------
+
+* Identify the enrollment date for each treatment group (date of first inhaler 
+* dispensed during the 180 day post-period for each group)
+
+preserve 
+	keep if patrecnum==1
+	keep patienticn switch_to_wixela stay_on_nonwixela
+	count //276369
+	
+	* merge with full inhaler prescription dataset 
+	merge 1:m patienticn using "P:\ORD_Prescott_202306018D\Cohort Build\Sarah\Data\Stata\final_rx_cohort_20240105.dta"
+	drop if _merge==2 
+	drop _merge
+	distinct patienticn //276369
+	
+	* identifying inhaler releasedatetimes
+	sort patienticn releasedatetime
+	gen inhaler_releasedatetime = releasedatetime 
+	local period strpos(inhaler_releasedatetime, ".")
+	gen releasedatetime2 = trim(cond(`period', substr(inhaler_releasedatetime, 1, `period' -1), inhaler_releasedatetime))
+
+	gen double releasedatetime3 = clock(releasedatetime2, "YMDhms")
+	format releasedatetime3 %tc
+
+	gen double releasedate = dofc(releasedatetime3)
+	format releasedate %td
+
+	drop releasedatetime2 releasedatetime3
+
+	rename releasedate inhaler_releasedate
+	order inhaler_releasedate, after(inhaler_releasedatetime)
+	sort patienticn inhaler_releasedate
+	
+	* identify switch post period 
+	gen preswitchdate_str = "01jul2021"
+	gen preswitchdate = date(preswitchdate_str, "DMY")
+	format preswitchdate %td
+
+	gen days_before_preswitch = preswitchdate-inhaler_releasedate
+
+	gen postperiod = inrange(days_before_preswitch, -180, 0) //range is 0 to -180 becuase postswitch period includes july 1 and 180 days afterwards (neg number b/c of calculation of 'days_before_preswitch')
+
+	* only keep records during the post period to identify enrollment date 
+	keep if postperiod == 1
+	distinct patienticn //263079
+	
+	* identify the earliest releasedate for wixela 
+	gsort patienticn -switch_to_wixela inhaler_releasedate
+	by patienticn: gen wixela_postperiod_num = _n if switch_to_wixela==1
+	gen wixela_enrollment_date = inhaler_releasedate if wixela_postperiod_num==1
+	format wixela_enrollment_date %td
+	replace wixela_enrollment_date = wixela_enrollment_date[_n-1] if wixela_enrollment_date==. & switch_to_wixela==1
+	format wixela_enrollment_date %td
+
+	* identify the earliest releasedate for non-Wixela 
+	gsort patienticn -stay_on_nonwixela inhaler_releasedate
+	by patienticn: gen nonwixela_postperiod_num = _n if stay_on_nonwixela==1
+	gen nonwixela_enrollment_date = inhaler_releasedate if nonwixela_postperiod_num==1
+	format nonwixela_enrollment_date %td
+	replace nonwixela_enrollment_date = nonwixela_enrollment_date[_n-1] if nonwixela_enrollment_date==. & stay_on_nonwixela==1
+	format nonwixela_enrollment_date %td
+	
+	* identify the first inhaler post period 
+	gen first_controller_postperiod = inlist(1, wixela_postperiod_num, nonwixela_postperiod_num)
+	tab first_controller_postperiod //263079
+	keep if first_controller_postperiod==1
+	
+	* identify enrollment date 
+	gen enrollment_date = wixela_enrollment_date
+	replace enrollment_date = nonwixela_enrollment_date if missing(enrollment_date)
+	format enrollment_date %td
+	
+	* identify enrollment inhaler 
+	gen enrollment_inhaler = .
+	replace enrollment_inhaler = 1 if !missing(nonwixela_enrollment_date)
+	replace enrollment_inhaler = 2 if !missing(wixela_enrollment_date)
+	lab def enrollment_inhaler 1 "Non-Wixela" 2 "Wixela"
+	lab val enrollment_inhaler enrollment_inhaler
+	tab enrollment_inhaler
+	tab enrollment_inhaler switch_to_wixela, m
+	tab enrollment_inhaler stay_on_nonwixela, m
+
+	* keep variables needed for merge 
+	keep patienticn enrollment_inhaler enrollment_date
+	order patienticn enrollment_inhaler enrollment_date
+	
+	* save tempfile to merge back with dataset 
+	tempfile enrollment 
+	save `enrollment'
+	
+restore 
+
+merge m:1 patienticn using `enrollment'	
+drop _merge
+distinct patienticn //276369
+
+* drop if enrollment inhaler date is missing - these patients neither switched 
+* nor stayed on symbicort for the 180 day period; they should not be in either 
+* treatment group
+tab enrollment_inhaler switch_to_wixela
+tab enrollment_inhaler stay_on_nonwixela
+
+count if missing(enrollment_date)
+count if missing(enrollment_inhaler)
+	
+drop if enrollment_inhaler == .
+
 *--------------------------	
-* identify outcomes 
+* Identify Outcomes 
 *--------------------------
 	* At 90- and 180-days post-enrollment (date of first controller inhaler dispensed, on or after 7/01/2021)
 		*	1. Mortality
@@ -163,16 +277,6 @@ bysort patienticn (datevalue): egen stay_on_nonwixela = max(mkg_tx2)
 		* 	4. ED visits (all cause, resp, pna)
 		* 	5. Hosps (all cause, resp, pna)
 
-gsort patienticn -postperiod_inhaler datevalue
-by patienticn: gen controller_postperiod_num = _n
-
-gen first_controller_postperiod = controller_postperiod_num==1		
-
-gen enrollment_date = datevalue if first_controller_postperiod==1 
-replace enrollment_date = enrollment_date[_n-1] if enrollment_date==.
-format enrollment_date %td
-
-drop first_controller_postperiod controller_postperiod_num
 
 sort patienticn patrecnum
 
@@ -196,7 +300,7 @@ save `mkgtte'
 
 * keep patienticns for merging with outcomes 
 keep if patrecnum==1
-count //276369
+count 
 
 * merge with outcomes
 keep patienticn enrollment_date enrollment_plus90_date enrollment_plus180_date
@@ -492,7 +596,7 @@ keep patienticn male age_at_switch race_3cat ever_combatvet ///
 	 hospresp_yr_preswitch_ind hosppneu_yr_preswitch_ind 
 
 duplicates drop
-count  
+count  //276369
 
 * create categories of albuterol use in the year pre-switch 
 gen albuterol_yr_preswitch_rnd = round(albuterol_yr_preswitch)
